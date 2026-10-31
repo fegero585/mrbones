@@ -2,6 +2,8 @@ import re
 import subprocess
 import time
 import wave
+from datetime import datetime
+
 import numpy as np
 import anthropic
 from piper import PiperVoice
@@ -23,6 +25,50 @@ LOCAL_WINDOW = 4      # how many steps around each moment count as "nearby"
 JAW_TIMING = 0.2      # jaw late? raise it (0.3). jaw early? lower it (0.1, 0.0)
 DEBUG = True          # print jaw info for each reply
 
+# ---- Radio stations ----
+# key: (station name, stream address)
+STATIONS = {
+    "doomed": ("Doomed, the Halloween special", "https://somafm.com/specials.pls"),
+    "classicrock": ("Classic Rock", "https://cast1.torontocast.com:4610/stream"),
+    "darkzone": ("The Dark Zone", "https://somafm.com/darkzone.pls"),
+    "dronezone": ("Drone Zone", "https://somafm.com/dronezone.pls"),
+    "secretagent": ("Secret Agent", "https://somafm.com/secretagent.pls"),
+    "metal": ("Metal Detector", "https://somafm.com/metal.pls"),
+    "seventies": ("Left Coast 70s", "https://somafm.com/seventies.pls"),
+    "groovesalad": ("Groove Salad", "https://somafm.com/groovesalad.pls"),
+    "indiepop": ("Indie Pop Rocks", "https://somafm.com/indiepop.pls"),
+    "illstreet": ("Illinois Street Lounge", "https://somafm.com/illstreet.pls"),
+}
+
+# ---- Tools Claude can use ----
+TOOLS = [
+    {
+        "name": "play_radio",
+        "description": (
+            "Play an internet radio station on Mr. Bones's speaker. "
+            "Use this whenever the user asks for music. Stations: "
+            "doomed = Halloween dark industrial, the best pick for spooky music; "
+            "classicrock = classic rock like Pink Floyd and Led Zeppelin; "
+            "darkzone = dark, spooky ambient; dronezone = eerie atmospheric; "
+            "secretagent = mysterious spy lounge; metal = heavy metal; "
+            "seventies = mellow 1970s rock; groovesalad = chill downtempo; "
+            "indiepop = indie pop; illstreet = vintage lounge."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "enum": list(STATIONS.keys())}
+            },
+            "required": ["station"],
+        },
+    },
+    {
+        "name": "stop_music",
+        "description": "Stop the music that is playing.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
 client = anthropic.Anthropic()
 voice = PiperVoice.load("en_US-ryan-medium.onnx")
 jaw = HardwarePWM(pwm_channel=0, hz=50, chip=0)
@@ -33,8 +79,14 @@ SYSTEM_PROMPT = (
     "but you are always friendly and never truly scary for kids. "
     "Keep answers short (1-3 sentences) because they will be spoken aloud. "
     "Only write the words you say out loud. Never describe actions or sounds, "
-    "and never use asterisks, emojis, or special formatting."
+    "and never use asterisks, emojis, or special formatting. "
+    "You can play internet radio with the play_radio tool and stop it "
+    "with the stop_music tool. When you start music, say one short line "
+    "introducing it."
 )
+
+music_player = None    # the running mpv program, if music is playing
+next_station = None    # station to start after Mr. Bones finishes talking
 
 
 def clean_text(text):
@@ -73,12 +125,10 @@ def plan_jaw(levels):
     plan = []
     open_run = 0
     for i, loud in enumerate(levels):
-        # Average loudness of the moments around this one
         lo = max(0, i - LOCAL_WINDOW)
         hi = min(len(levels), i + LOCAL_WINDOW + 1)
         local_avg = sum(levels[lo:hi]) / (hi - lo)
 
-        # Open on syllables: loud enough AND louder than what's around it
         is_syllable = loud >= THRESHOLD and loud >= local_avg * 0.9
 
         if is_syllable and open_run < MAX_OPEN_STEPS:
@@ -132,6 +182,73 @@ def speak(text):
     play_with_jaw(voice_path)
 
 
+def start_radio(station):
+    """Start a radio station playing in the background."""
+    global music_player
+    stop_music()
+    name, url = STATIONS[station]
+    print(f"[radio] playing {name}")
+    music_player = subprocess.Popen(["mpv", "--no-video", "--no-terminal", url],
+    stdin=subprocess.DEVNULL,
+    )
+
+
+def stop_music():
+    """Stop the radio if it's playing."""
+    global music_player
+    if music_player is not None and music_player.poll() is None:
+        music_player.terminate()
+        music_player.wait()
+    music_player = None
+
+
+def run_tool(name, tool_input):
+    """Do what Claude asked for and return a short note about what happened."""
+    global next_station
+    if name == "play_radio":
+        station = tool_input.get("station")
+        if station not in STATIONS:
+            return f"Unknown station. Choose from: {', '.join(STATIONS)}."
+        next_station = station
+        return f"{STATIONS[station][0]} will start right after you finish talking."
+    if name == "stop_music":
+        stop_music()
+        return "The music is stopped."
+    return f"Unknown tool: {name}"
+
+
+def ask_claude(user_text):
+    """Send a message to Claude, run any tools it asks for, and return its reply."""
+    history.append({"role": "user", "content": user_text})
+
+    while True:
+        now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+        response = client.messages.create(
+            model="claude-haiku-5-5",
+            max_tokens=300,
+            system=SYSTEM_PROMPT + f" The current date and time is {now}.",
+            tools=TOOLS,
+            messages=history,
+        )
+        history.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            break
+
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": run_tool(block.name, block.input),
+                })
+        history.append({"role": "user", "content": results})
+
+    reply = "".join(block.text for block in response.content if block.type == "text")
+    return clean_text(reply)
+
+
 history = []
 jaw.start(CLOSED)
 
@@ -142,23 +259,18 @@ try:
     while True:
         user_text = input("You: ")
         if user_text.strip().lower() == "quit":
+            stop_music()
             print("Mr. Bones: Bone voyage!")
             speak("Bone voyage!")
             break
 
-        history.append({"role": "user", "content": user_text})
-
-        response = client.messages.create(
-            model="claude-haiku-5-5",
-            max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=history,
-        )
-
-        reply = "".join(block.text for block in response.content if block.type == "text")
-        reply = clean_text(reply)
-        history.append({"role": "assistant", "content": reply})
+        reply = ask_claude(user_text)
         print(f"Mr. Bones: {reply}\n")
         speak(reply)
+
+        if next_station:
+            start_radio(next_station)
+            next_station = None
 finally:
+    stop_music()
     jaw.stop()
