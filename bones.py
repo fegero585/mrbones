@@ -25,6 +25,9 @@ LOCAL_WINDOW = 4      # how many steps around each moment count as "nearby"
 JAW_TIMING = 0.2      # jaw late? raise it (0.3). jaw early? lower it (0.1, 0.0)
 DEBUG = True          # print jaw info for each reply
 
+# ---- Eye settings ----
+EYES_PIN = 23         # GPIO pin the eye LEDs are on
+
 # ---- Radio stations ----
 # key: (station name, stream address)
 STATIONS = {
@@ -87,6 +90,11 @@ SYSTEM_PROMPT = (
 
 music_player = None    # the running mpv program, if music is playing
 next_station = None    # station to start after Mr. Bones finishes talking
+
+def eyes(on):
+     """Turn the eye LEDs on or off."""
+     level = "dh" if on else "dl"
+     subprocess.run(["pinctrl", "set", str(EYES_PIN), "op", level])
 
 
 def clean_text(text):
@@ -251,6 +259,7 @@ def ask_claude(user_text):
 
 history = []
 jaw.start(CLOSED)
+eyes(True)
 
 try:
     print("Mr. Bones is awake! Type 'quit' to exit.\n")
@@ -273,4 +282,5 @@ try:
             next_station = None
 finally:
     stop_music()
+    eyes(False)
     jaw.stop()
