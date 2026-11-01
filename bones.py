@@ -1,8 +1,13 @@
+import argparse
+import json
 import re
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 import wave
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import anthropic
@@ -12,13 +17,13 @@ from rpi_hardware_pwm import HardwarePWM
 import ears
 
 # ---- Voice settings ----
-PITCH = "-300"    # lower = deeper
-TEMPO = "0.85"    # lower = slower
-BASS = "+8"         # higher = more low-end rumble
-OVERDRIVE = "4"     # higher = more growl (0 to 10)
+PITCH = "-300"        # lower = deeper
+TEMPO = "0.85"        # lower = slower
+BASS = "+8"           # higher = more low-end rumble
+OVERDRIVE = "4"       # higher = more growl (0 to 10)
 
 # ---- Jaw settings ----
-CLOSED = 9.70         # jaw shut
+CLOSED = 9.75         # jaw shut
 OPEN = 6.5            # jaw open
 STEP = 0.1            # seconds per jaw move (gives the servo time to open AND close)
 THRESHOLD = 0.2       # quieter than this = mouth closed (silence between words)
@@ -33,7 +38,12 @@ DEBUG = True          # print jaw info for each reply
 EYES_PIN = 23         # GPIO pin the eye LEDs are on
 
 # ---- Input settings ----
-USE_MIC = True        # False = type to Mr. Bones like before
+USE_MIC = True        # False = type to Mr. Bones instead of talking
+
+# ---- Weather settings ----
+HOME_CITY = "Rochester, New York"
+HOME_LAT = 43.1566
+HOME_LON = -77.6088
 
 # ---- Radio stations ----
 # key: (station name, stream address)
@@ -77,32 +87,73 @@ TOOLS = [
         "description": "Stop the music that is playing.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "get_weather",
+        "description": (
+            "Get the current weather and a 3-day forecast. Use this whenever "
+            "the user asks about weather, temperature, rain, snow, or what to wear. "
+            "Leave city out for home (Rochester, New York). For another place, "
+            "give just the city name, like 'Lander'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "City name only, no state. Leave out for home.",
+                }
+            },
+        },
+    },
 ]
+
+# ---- Personality (prompt library) ----
+# Each .txt file in the prompts folder is a personality.
+# Pick one when starting:  python bones.py -p apocalypse
+PROMPTS_FOLDER = Path(__file__).parent / "prompts"
+PROMPT_NAMES = sorted(file.stem for file in PROMPTS_FOLDER.glob("*.txt"))
+
+parser = argparse.ArgumentParser(description="Run Mr. Bones, the talking skeleton.")
+parser.add_argument(
+    "-p", "--prompt",
+    choices=PROMPT_NAMES,
+    default="normal",
+    help="which personality file to use from the prompts folder (default: normal)",
+)
+args = parser.parse_args()
+
+PERSONALITY = (PROMPTS_FOLDER / f"{args.prompt}.txt").read_text().strip()
+
+# Required: always added, because everything he says is spoken out loud.
+SPEAKING_RULES = (
+    "Keep answers short (1-3 sentences) because they will be spoken aloud. "
+    "Only write the words you say out loud. Never describe actions or sounds, "
+    "and never use asterisks, emojis, lists, or special formatting. "
+    "You can play internet radio with the play_radio tool and stop it "
+    "with the stop_music tool. When you start music, say one short line "
+    "introducing it. You can check the weather with the get_weather tool."
+)
+
+SYSTEM_PROMPT = PERSONALITY + " " + SPEAKING_RULES
 
 client = anthropic.Anthropic()
 voice = PiperVoice.load("en_US-ryan-medium.onnx")
 jaw = HardwarePWM(pwm_channel=0, hz=50, chip=0)
 
-SYSTEM_PROMPT = (
-    "You are Mr. Bones, a spooky-but-fun talking skeleton. "
-    "You speak with playful creepiness and lots of bone puns, "
-    "but you are always friendly and never truly scary for kids. "
-    "Keep answers short (1-3 sentences) because they will be spoken aloud. "
-    "Only write the words you say out loud. Never describe actions or sounds, "
-    "and never use asterisks, emojis, or special formatting. "
-    "You can play internet radio with the play_radio tool and stop it "
-    "with the stop_music tool. When you start music, say one short line "
-    "introducing it."
-)
-
 music_player = None    # the running mpv program, if music is playing
 next_station = None    # station to start after Mr. Bones finishes talking
+history = []           # the conversation so far
+
+
+# ================= Eyes =================
 
 def eyes(on):
     """Turn the eye LEDs on or off."""
     level = "dh" if on else "dl"
     subprocess.run(["pinctrl", "set", str(EYES_PIN), "op", level])
 
+
+# ================= Talking and the jaw =================
 
 def clean_text(text):
     """Remove anything that shouldn't be spoken, like *actions*."""
@@ -180,17 +231,6 @@ def play_with_jaw(wav_path):
     jaw.change_duty_cycle(CLOSED)
 
 
-def start_radio(station):
-    """Start a radio station playing in the background."""
-    global music_player
-    stop_music()
-    name, url = STATIONS[station]
-    print(f"[radio] playing {name}")
-    music_player = subprocess.Popen(["mpv", "--no-video", "--no-terminal", url],
-    stdin=subprocess.DEVNULL,
-    )
-
-
 def speak(text):
     """Make speech with Piper, then make it deep, slow and gritty with sox, then talk."""
     text = clean_text(text)
@@ -212,6 +252,20 @@ def speak(text):
     play_with_jaw(voice_path)
 
 
+# ================= Music =================
+
+def start_radio(station):
+    """Start a radio station playing in the background."""
+    global music_player
+    stop_music()
+    name, url = STATIONS[station]
+    print(f"[radio] playing {name}")
+    music_player = subprocess.Popen(
+        ["mpv", "--no-video", "--no-terminal", url],
+        stdin=subprocess.DEVNULL,
+    )
+
+
 def stop_music():
     """Stop the radio if it's playing."""
     global music_player
@@ -220,6 +274,83 @@ def stop_music():
         music_player.wait()
     music_player = None
 
+
+# ================= Weather =================
+
+# Open-Meteo sends a number for the weather; this turns it into words.
+WEATHER_WORDS = {
+    0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "snow showers", 86: "heavy snow showers",
+    95: "thunderstorms", 96: "thunderstorms with hail", 99: "thunderstorms with hail",
+}
+
+
+def fetch_json(url, params):
+    """Download a web address and turn the JSON reply into a Python dictionary."""
+    full_url = url + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(full_url, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def get_weather(city=None):
+    """Return the current weather and a 3-day forecast as plain sentences."""
+    # Step 1: figure out where
+    if city:
+        found = fetch_json("https://geocoding-api.open-meteo.com/v1/search",
+                           {"name": city, "count": 1})
+        if not found.get("results"):
+            return f"Could not find a place called {city}."
+        place = found["results"][0]
+        name = f"{place['name']}, {place.get('admin1', place.get('country', ''))}"
+        lat, lon = place["latitude"], place["longitude"]
+    else:
+        name, lat, lon = HOME_CITY, HOME_LAT, HOME_LON
+
+    # Step 2: get the weather for that spot
+    data = fetch_json("https://api.open-meteo.com/v1/forecast", {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                 "precipitation_probability_max",
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "timezone": "auto",
+        "forecast_days": 3,
+    })
+
+    # Step 3: turn the numbers into sentences
+    now = data["current"]
+    sentences = [
+        f"Weather for {name}.",
+        f"Right now it is {round(now['temperature_2m'])} degrees, "
+        f"feels like {round(now['apparent_temperature'])}, "
+        f"{WEATHER_WORDS.get(now['weather_code'], 'unknown conditions')}, "
+        f"with wind at {round(now['wind_speed_10m'])} miles per hour.",
+    ]
+
+    daily = data["daily"]
+    for i, date in enumerate(daily["time"]):
+        day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+        chance = daily["precipitation_probability_max"][i] or 0
+        sentences.append(
+            f"{day_name}: high of {round(daily['temperature_2m_max'][i])}, "
+            f"low of {round(daily['temperature_2m_min'][i])}, "
+            f"{WEATHER_WORDS.get(daily['weather_code'][i], 'unknown conditions')}, "
+            f"{chance} percent chance of rain or snow."
+        )
+
+    return " ".join(sentences)
+
+
+# ================= Claude =================
 
 def run_tool(name, tool_input):
     """Do what Claude asked for and return a short note about what happened."""
@@ -233,6 +364,11 @@ def run_tool(name, tool_input):
     if name == "stop_music":
         stop_music()
         return "The music is stopped."
+    if name == "get_weather":
+        try:
+            return get_weather(tool_input.get("city"))
+        except Exception as error:
+            return f"The weather service could not be reached: {error}"
     return f"Unknown tool: {name}"
 
 
@@ -268,11 +404,13 @@ def ask_claude(user_text):
     return clean_text(reply)
 
 
-history = []
+# ================= Main program =================
+
 jaw.start(CLOSED)
 eyes(True)
 
 try:
+    print(f"[prompt] using prompts/{args.prompt}.txt")
     print("Mr. Bones is awake! Say 'Hey Mister Bones' (Ctrl+C to exit).\n")
     speak("Mister Bones has risen!")
 
@@ -295,11 +433,12 @@ try:
             speak("Bone voyage!")
             break
 
+        saved = len(history)    # remember where the conversation was
         try:
             reply = ask_claude(user_text)
         except anthropic.APIError as error:
             print(f"[error] {error}")
-            history.pop()
+            del history[saved:]   # forget the half-finished exchange
             reply = "My skull is foggy. Ask me again in a moment."
 
         print(f"Mr. Bones: {reply}\n")
