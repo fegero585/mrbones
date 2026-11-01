@@ -105,6 +105,25 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "wikipedia",
+        "description": (
+            "Look up facts on Wikipedia: people, places, history, science, "
+            "movies, animals and more. Use this when you are not sure of a fact, "
+            "or the user asks who, what or where something is. "
+            "Not for today's news, weather, or very recent events."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "What to look up, like 'Vincent Price' or 'Mount Marcy'.",
+                }
+            },
+            "required": ["topic"],
+        },
+    },
 ]
 
 # ---- Personality (prompt library) ----
@@ -131,7 +150,9 @@ SPEAKING_RULES = (
     "and never use asterisks, emojis, lists, or special formatting. "
     "You can play internet radio with the play_radio tool and stop it "
     "with the stop_music tool. When you start music, say one short line "
-    "introducing it. You can check the weather with the get_weather tool."
+    "introducing it. You can check the weather with the get_weather tool. "
+    "You can look up facts with the wikipedia tool. Never say that you are "
+    "looking something up, just give the answer."
 )
 
 SYSTEM_PROMPT = PERSONALITY + " " + SPEAKING_RULES
@@ -291,13 +312,16 @@ WEATHER_WORDS = {
     95: "thunderstorms", 96: "thunderstorms with hail", 99: "thunderstorms with hail",
 }
 
-
-def fetch_json(url, params):
+def fetch_json(url, params=None):
     """Download a web address and turn the JSON reply into a Python dictionary."""
-    full_url = url + "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(full_url, timeout=10) as response:
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MrBones/1.0 (talking skeleton hobby project)"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read())
-
 
 def get_weather(city=None):
     """Return the current weather and a 3-day forecast as plain sentences."""
@@ -349,6 +373,32 @@ def get_weather(city=None):
 
     return " ".join(sentences)
 
+# ================= Wikipedia =================
+
+def get_wikipedia(topic):
+    """Look up a topic on Wikipedia and return a short summary."""
+    # Step 1: search for the best matching page
+    found = fetch_json("https://en.wikipedia.org/w/api.php", {
+        "action": "query",
+        "list": "search",
+        "srsearch": topic,
+        "srlimit": 1,
+        "format": "json",
+    })
+    matches = found["query"]["search"]
+    if not matches:
+        return f"Wikipedia has nothing about {topic}."
+
+    # Step 2: get that page's summary
+    title = matches[0]["title"]
+    page = urllib.parse.quote(title.replace(" ", "_"), safe="")
+    summary = fetch_json(f"https://en.wikipedia.org/api/rest_v1/page/summary/{page}")
+
+    text = summary.get("extract", "")
+    if not text:
+        return f"Found the page {title}, but it has no summary."
+    return f"From the Wikipedia page {title}: {text[:1500]}"
+
 
 # ================= Claude =================
 
@@ -369,6 +419,11 @@ def run_tool(name, tool_input):
             return get_weather(tool_input.get("city"))
         except Exception as error:
             return f"The weather service could not be reached: {error}"
+    if name == "wikipedia":
+        try:
+            return get_wikipedia(tool_input.get("topic", ""))
+        except Exception as error:
+            return f"Wikipedia could not be reached: {error}"    
     return f"Unknown tool: {name}"
 
 
