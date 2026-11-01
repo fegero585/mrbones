@@ -4,3 +4,4 @@ __pycache__/
 *.onnx.json
 test.wav
 .env
+models/

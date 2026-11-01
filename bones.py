@@ -9,12 +9,16 @@ import anthropic
 from piper import PiperVoice
 from rpi_hardware_pwm import HardwarePWM
 
+import ears
+
 # ---- Voice settings ----
 PITCH = "-300"    # lower = deeper
 TEMPO = "0.85"    # lower = slower
+BASS = "+8"         # higher = more low-end rumble
+OVERDRIVE = "4"     # higher = more growl (0 to 10)
 
 # ---- Jaw settings ----
-CLOSED = 9.75         # jaw shut
+CLOSED = 9.70         # jaw shut
 OPEN = 6.5            # jaw open
 STEP = 0.1            # seconds per jaw move (gives the servo time to open AND close)
 THRESHOLD = 0.2       # quieter than this = mouth closed (silence between words)
@@ -27,6 +31,9 @@ DEBUG = True          # print jaw info for each reply
 
 # ---- Eye settings ----
 EYES_PIN = 23         # GPIO pin the eye LEDs are on
+
+# ---- Input settings ----
+USE_MIC = True        # False = type to Mr. Bones like before
 
 # ---- Radio stations ----
 # key: (station name, stream address)
@@ -92,9 +99,9 @@ music_player = None    # the running mpv program, if music is playing
 next_station = None    # station to start after Mr. Bones finishes talking
 
 def eyes(on):
-     """Turn the eye LEDs on or off."""
-     level = "dh" if on else "dl"
-     subprocess.run(["pinctrl", "set", str(EYES_PIN), "op", level])
+    """Turn the eye LEDs on or off."""
+    level = "dh" if on else "dl"
+    subprocess.run(["pinctrl", "set", str(EYES_PIN), "op", level])
 
 
 def clean_text(text):
@@ -173,8 +180,19 @@ def play_with_jaw(wav_path):
     jaw.change_duty_cycle(CLOSED)
 
 
+def start_radio(station):
+    """Start a radio station playing in the background."""
+    global music_player
+    stop_music()
+    name, url = STATIONS[station]
+    print(f"[radio] playing {name}")
+    music_player = subprocess.Popen(["mpv", "--no-video", "--no-terminal", url],
+    stdin=subprocess.DEVNULL,
+    )
+
+
 def speak(text):
-    """Make speech with Piper, lower the pitch and slow it with sox, then talk."""
+    """Make speech with Piper, then make it deep, slow and gritty with sox, then talk."""
     text = clean_text(text)
     if not text:
         return
@@ -185,20 +203,13 @@ def speak(text):
         voice.synthesize_wav(text, wav_file)
 
     subprocess.run(["sox", raw_path, voice_path,
-                    "pitch", PITCH, "tempo", TEMPO, "norm", "-1"])
+                    "pitch", PITCH,
+                    "tempo", TEMPO,
+                    "bass", BASS,
+                    "overdrive", OVERDRIVE,
+                    "gain", "-n", "-2"], check=True)
 
     play_with_jaw(voice_path)
-
-
-def start_radio(station):
-    """Start a radio station playing in the background."""
-    global music_player
-    stop_music()
-    name, url = STATIONS[station]
-    print(f"[radio] playing {name}")
-    music_player = subprocess.Popen(["mpv", "--no-video", "--no-terminal", url],
-    stdin=subprocess.DEVNULL,
-    )
 
 
 def stop_music():
@@ -262,18 +273,35 @@ jaw.start(CLOSED)
 eyes(True)
 
 try:
-    print("Mr. Bones is awake! Type 'quit' to exit.\n")
+    print("Mr. Bones is awake! Say 'Hey Mister Bones' (Ctrl+C to exit).\n")
     speak("Mister Bones has risen!")
 
     while True:
-        user_text = input("You: ")
-        if user_text.strip().lower() == "quit":
+        if USE_MIC:
+            ears.wait_for_wake_word()
+            print("[ears] wake word heard")
+            speak("Yes?")
+            user_text = ears.listen_for_question()
+            if not user_text:
+                speak("Speak up, mortal. I have no ears.")
+                continue
+            print(f"You: {user_text}")
+        else:
+            user_text = input("You: ")
+
+        if user_text.strip().lower() in ("quit", "go to sleep"):
             stop_music()
             print("Mr. Bones: Bone voyage!")
             speak("Bone voyage!")
             break
 
-        reply = ask_claude(user_text)
+        try:
+            reply = ask_claude(user_text)
+        except anthropic.APIError as error:
+            print(f"[error] {error}")
+            history.pop()
+            reply = "My skull is foggy. Ask me again in a moment."
+
         print(f"Mr. Bones: {reply}\n")
         speak(reply)
 
