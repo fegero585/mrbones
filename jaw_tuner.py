@@ -1,7 +1,7 @@
 from rpi_hardware_pwm import HardwarePWM
 
 # Safe range for the servo. Don't go past these.
-MIN_POS = 2.0
+MIN_POS = 5.0
 MAX_POS = 12.0
 
 servo = HardwarePWM(pwm_channel=0, hz=50, chip=0)

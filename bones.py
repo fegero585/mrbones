@@ -23,8 +23,8 @@ BASS = "+8"           # higher = more low-end rumble
 OVERDRIVE = "4"       # higher = more growl (0 to 10)
 
 # ---- Jaw settings ----
-CLOSED = 9.75         # jaw shut
-OPEN = 6.5            # jaw open
+CLOSED = 10.7         # jaw shut
+OPEN = 8.9            # jaw open
 STEP = 0.1            # seconds per jaw move (gives the servo time to open AND close)
 THRESHOLD = 0.2       # quieter than this = mouth closed (silence between words)
 GAIN = 1.5            # higher = mouth opens wider on normal speech
@@ -474,6 +474,7 @@ try:
             ears.wait_for_wake_word()
             print("[ears] wake word heard")
             speak("Yes?")
+            time.sleep(0.5)    # let "Yes?" finish coming out of the speaker
             user_text = ears.listen_for_question()
             if not user_text:
                 speak("Speak up, mortal. I have no ears.")

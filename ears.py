@@ -90,6 +90,9 @@ def listen_for_question():
 
     _clear_old_audio()
     stream.start()
+    time.sleep(0.3)        # let the mic settle
+    _clear_old_audio()     # toss anything it caught while starting up
+    
     try:
         while True:
             try:
