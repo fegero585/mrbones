@@ -9,7 +9,8 @@ from vosk import Model, KaldiRecognizer, SetLogLevel
 
 # ---- Ear settings ----
 SAMPLE_RATE = 16000       # Vosk wants 16,000 samples per second
-MIC_DEVICE = None         # None = default mic (the Arctis, through PipeWire)
+MIC_NAME = "respeaker"    # part of the mic's name to look for (not case sensitive)
+MIC_CHANNEL = 0           # reSpeaker channel 0 = the cleaned-up voice channel
 WAKE_WORD = "mister bones"
 WAIT_FOR_QUESTION = 8     # seconds to wait for someone to start talking after waking
 MAX_QUESTION = 15         # seconds before we stop listening, even mid-sentence
@@ -21,17 +22,34 @@ model = Model(str(MODEL_PATH))
 audio_queue = queue.Queue()
 
 
+def _find_mic():
+    """Find the reSpeaker by name. Returns (device number, channel count).
+    Falls back to the default mic if the reSpeaker isn't plugged in."""
+    for i, dev in enumerate(sd.query_devices()):
+        if MIC_NAME in dev["name"].lower() and dev["max_input_channels"] > 0:
+            print(f"Ears: using {dev['name']}")
+            return i, dev["max_input_channels"]
+    print("Ears: reSpeaker not found, using the default mic")
+    return None, 1
+
+
+MIC_DEVICE, MIC_CHANNELS = _find_mic()
+if MIC_CHANNEL >= MIC_CHANNELS:   # default mic may only have 1 channel
+    MIC_CHANNEL = 0
+
+
 def _mic_callback(indata, frames, time_info, status):
-    """sounddevice calls this every time a chunk of mic audio is ready."""
-    audio_queue.put(bytes(indata))
+    """sounddevice calls this every time a chunk of mic audio is ready.
+    indata has one column per channel - keep only the clean voice channel."""
+    audio_queue.put(indata[:, MIC_CHANNEL].tobytes())
 
 
-stream = sd.RawInputStream(
+stream = sd.InputStream(
     samplerate=SAMPLE_RATE,
     blocksize=4000,       # 4000 samples = a quarter second per chunk
     device=MIC_DEVICE,
     dtype="int16",
-    channels=1,
+    channels=MIC_CHANNELS,
     callback=_mic_callback,
 )
 
